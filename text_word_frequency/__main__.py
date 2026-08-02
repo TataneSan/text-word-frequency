@@ -1,3 +1,5 @@
+"""Entry point for `python -m text_word_frequency`."""
+
 import sys
 
 from .cli import main

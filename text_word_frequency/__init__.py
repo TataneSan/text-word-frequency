@@ -1,3 +1,3 @@
-"""Word frequency counter for text files"""
+"""text-word-frequency package."""
 
 __version__ = "1.0.0"

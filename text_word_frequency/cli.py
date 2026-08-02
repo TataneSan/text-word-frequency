@@ -1,4 +1,14 @@
-"""Count word frequencies in text files or stdin."""
+"""text-word-frequency: count word frequencies in a text.
+
+Tokenizes a text into words (Unicode-aware, configurable case folding and
+minimum word length) and reports each word with its occurrence count, most
+frequent first.
+
+Exit codes:
+    0  success (all gates satisfied)
+    1  I/O error
+    2  a gate failed (--require-word, --forbid-word, --require-min-unique)
+"""
 
 import argparse
 import json
@@ -6,93 +16,120 @@ import re
 import sys
 from collections import Counter
 
-__all__ = ["main"]
+WORD_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)*", re.UNICODE)
 
-TOKEN_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9_'-]+")
 
-def collect(paths, lower, min_len, strip_digits):
-    c = Counter()
-    total = 0
-    for path in paths:
-        fh = sys.stdin if path == "-" else open(path, encoding="utf-8", errors="replace")
-        close = fh is not sys.stdin
-        try:
-            for line in fh:
-                for w in TOKEN_RE.findall(line):
-                    if lower:
-                        w = w.lower()
-                    if strip_digits and any(ch.isdigit() for ch in w):
-                        continue
-                    if len(w) < min_len:
-                        continue
-                    c[w] += 1
-                    total += 1
-        except OSError as e:
-            print("error: %s: %s" % (path, e), file=sys.stderr)
-            return None, -1
-        finally:
-            if close:
-                fh.close()
-    return c, total
+def read_text(path):
+    if path is None or path == "-":
+        return sys.stdin.read()
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def count_words(text, ignore_case, min_length):
+    words = WORD_RE.findall(text)
+    if ignore_case:
+        words = [w.casefold() for w in words]
+    words = [w for w in words if len(w) >= min_length]
+    return Counter(words)
+
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="text-word-frequency", description=__doc__,
-        epilog="Exit codes: 0 success, 1 file error, 2 gate failed.")
-    p.add_argument("files", nargs="*", default=["-"], help="text files (default: stdin)")
-    p.add_argument("-n", "--top", type=int, default=None, help="show only top N")
-    p.add_argument("--min-len", type=int, default=1)
-    p.add_argument("--min-count", type=int, default=1)
-    p.add_argument("-i", "--ignore-case", action="store_true")
-    p.add_argument("--strip-digits", action="store_true", help="drop tokens containing digits")
-    p.add_argument("--freq", action="store_true", help="show relative frequency (ppm)")
-    p.add_argument("--require-word", metavar="WORD",
-                   help="CI gate: exit 2 unless WORD appears at least "
-                        "--require-count times (default: 1)")
-    p.add_argument("--require-count", type=int, default=1, metavar="N",
-                   help="occurrences required for --require-word (default: 1)")
-    p.add_argument("--require-min-unique", type=int, default=None, metavar="N",
-                   help="CI gate: exit 2 when fewer than N unique words")
-    p.add_argument("--json", action="store_true")
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(
+        prog="text-word-frequency",
+        description="Count word frequencies in a text file or stdin.",
+    )
+    parser.add_argument("file", nargs="?", default=None,
+                        help="input text file (default: stdin, '-' for stdin)")
+    parser.add_argument("--top", type=int, default=None, metavar="N",
+                        help="show only the N most frequent words")
+    parser.add_argument("--min-count", type=int, default=1, metavar="N",
+                        help="only report words occurring at least N times (default 1)")
+    parser.add_argument("--min-length", type=int, default=1, metavar="N",
+                        help="ignore words shorter than N characters (default 1)")
+    parser.add_argument("--ignore-case", action="store_true",
+                        help="fold case before counting")
+    parser.add_argument("--with-ratio", action="store_true",
+                        help="append the share of total words per entry")
+    parser.add_argument("--require-word", metavar="WORD",
+                        help="exit 2 unless WORD occurs at least once")
+    parser.add_argument("--forbid-word", metavar="WORD",
+                        help="exit 2 if WORD occurs at least once")
+    parser.add_argument("--require-min-unique", type=int, metavar="N",
+                        help="exit 2 unless at least N unique words were found")
+    parser.add_argument("--json", action="store_true",
+                        help="report as JSON (with gates + violated list)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress the word list; only gates decide the exit code")
+    args = parser.parse_args(argv)
 
-    c, total = collect(args.files, args.ignore_case, args.min_len, args.strip_digits)
-    if c is None:
+    try:
+        text = read_text(args.file)
+    except OSError as exc:
+        print("text-word-frequency: %s" % exc, file=sys.stderr)
         return 1
-    items = [(w, n) for w, n in c.most_common() if n >= args.min_count]
+
+    counts = count_words(text, args.ignore_case, args.min_length)
+    items = [(w, c) for w, c in counts.items() if c >= args.min_count]
+    items.sort(key=lambda wc: (-wc[1], wc[0]))
     if args.top is not None:
         items = items[: args.top]
 
-    ok = True
+    total_words = sum(counts.values())
+    unique_words = len(counts)
+
+    gates = []
+    violated = []
+
+    def gate(name, target, ok):
+        ok = bool(ok)
+        gates.append({"name": name, "target": target, "ok": ok})
+        if not ok:
+            violated.append(name)
+
     if args.require_word is not None:
-        needle = args.require_word.lower() if args.ignore_case else args.require_word
-        if c.get(needle, 0) < args.require_count:
-            ok = False
-            print("gate failed: %r appears %d time(s) < required %d"
-                  % (args.require_word, c.get(needle, 0), args.require_count),
-                  file=sys.stderr)
-    if args.require_min_unique is not None and len(c) < args.require_min_unique:
-        ok = False
-        print("gate failed: %d unique word(s) < required %d"
-              % (len(c), args.require_min_unique), file=sys.stderr)
+        probe = args.require_word
+        if args.ignore_case:
+            probe = probe.casefold()
+        gate("require-word", probe, counts.get(probe, 0) > 0)
+    if args.forbid_word is not None:
+        probe = args.forbid_word
+        if args.ignore_case:
+            probe = probe.casefold()
+        gate("forbid-word", probe, counts.get(probe, 0) == 0)
+    if args.require_min_unique is not None:
+        gate("require-min-unique", args.require_min_unique, unique_words >= args.require_min_unique)
 
     if args.json:
-        obj = {"total_words": total,
-               "unique_words": len(c),
-               "ok": ok,
-               "words": [{"word": w, "count": n,
-                          **({} if not args.freq else {"ppm": round(n / total * 1e6, 2) if total else 0})}
-                         for w, n in items]}
-        print(json.dumps(obj, indent=2, ensure_ascii=False))
-        return 0 if ok else 2
+        print(json.dumps(
+            {
+                "total_words": total_words,
+                "unique_words": unique_words,
+                "min_count": args.min_count,
+                "words": [
+                    dict(
+                        {"word": w, "count": c},
+                        **({"ratio": (c / total_words) if total_words else 0.0} if args.with_ratio else {}),
+                    )
+                    for w, c in items
+                ],
+                "gates": gates,
+                "violated": violated,
+                "ok": not violated,
+            },
+            indent=2,
+        ))
+    elif not args.quiet:
+        for w, c in items:
+            if args.with_ratio:
+                ratio = (c / total_words) if total_words else 0.0
+                print("%8d  %6.2f%%  %s" % (c, ratio * 100.0, w))
+            else:
+                print("%8d  %s" % (c, w))
+        print("total: %d words, %d unique" % (total_words, unique_words))
 
-    print("total: %d  unique: %d" % (total, len(c)))
-    width = max((len(w) for w, _ in items), default=0)
-    for w, n in items:
-        line = "%-*s %d" % (width, w, n)
-        if args.freq and total:
-            line += "  (%.2f ppm)" % (n / total * 1e6)
-        print(line)
-    return 0 if ok else 2
+    return 2 if violated else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
