@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text-word-frequency"
+version = "1.0.0"
+description = "Word frequency counter for text files"
+readme = "README.md"
+authors = [{ name = "TataneSan" }]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+
+[project.scripts]
+text-word-frequency = "text_word_frequency.cli:main"
+
+[tool.setuptools]
+packages = ["text_word_frequency"]
